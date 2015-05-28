@@ -1,10 +1,11 @@
 {-# LANGUAGE ExistentialQuantification #-}
 module Main where
-import System.IO
 import Control.Monad
 import Control.Monad.Error
-import Text.ParserCombinators.Parsec hiding (spaces)
+import Data.IORef
 import System.Environment
+import System.IO
+import Text.ParserCombinators.Parsec hiding (spaces)
 
 
 symbol :: Parser Char
@@ -68,6 +69,9 @@ data LispVal = Atom String
              | Number Integer
              | String String
              | Bool Bool
+             | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+             | Func { params :: [String], vararg :: (Maybe String),
+                      body :: [LispVal], closure :: Env }
 
 instance Show LispVal where show = showVal
 
@@ -138,21 +142,26 @@ equal badArgList = throwError $ NumArgs 2 badArgList
 -- The construct val@(String _) matches against any LispVal of type string,
 -- then binds val to the whole LispVal, not just the contents of the String
 -- constructor, so the result has type LispVal not String
-eval :: LispVal -> ThrowsError LispVal
-eval val@(String _) = return val
-eval val@(Number _) = return val
-eval val@(Bool _) = return val
-eval (List [Atom "quote", val]) = return val
-eval (List [Atom "if", pred, conseq, alt]) =
-        do result <- eval pred
+eval :: Env -> LispVal -> IOThrowsError LispVal
+eval env val@(String _) = return val
+eval env val@(Number _) = return val
+eval env val@(Bool _) = return val
+eval env (Atom id) = getVar env id
+eval env (List [Atom "quote", val]) = return val
+eval env (List [Atom "if", pred, conseq, alt]) =
+        do result <- eval env pred
            case result of
-               Bool False -> eval alt
-               otherwise -> eval conseq
+               Bool False -> eval env alt
+               otherwise -> eval env conseq
+eval env (List [Atom "set!", Atom var, form]) =
+     eval env form >>= setVar env var
+eval env (List [Atom "define", Atom var, form]) =
+     eval env form >>= defineVar env var
 -- The : is the cons operator. This gives ups (x:xs) behavior, where x is
 -- an Atom. We recursively evaluate all argument lists for further
 -- functions, to handle things like (+ 2 (* 3 4) 5) = 19
-eval (List (Atom func : args)) = mapM eval args >>= apply func
-eval badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+eval env (List (Atom func : args)) = mapM (eval env) args >>= liftThrows . apply func
+eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 -- Given a key func, we lookup its value in primites.
 -- If this isn't found, the function returns false. Otherwise,
@@ -284,6 +293,63 @@ readExpr input = case parse parseExpr "lisp" input of
     Left err -> throwError $ Parser err
     Right val -> return val
 
+-----------------------------------------------------
+-- State and Variables
+type Env = IORef [(String, IORef LispVal)]
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+-- This is a type synonym for a compined LispError and IO monad, using the
+-- ErrorT monad transformation
+type IOThrowsError = ErrorT LispError IO
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err) = throwError err
+liftThrows (Right val) = return val
+
+-- Takes any defined trapError action and returns is IO string
+-- representation
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = runErrorT (trapError action) >>= return . extractValue
+
+-- Given an environment and a string, determine whether that string is
+-- bound in the environment by reading it and passing that to return
+-- a maybe construction composed with lookup var
+isBound :: Env -> String -> IO Bool
+isBound envRef var = readIORef envRef >>= return . maybe False (const True) . lookup var
+
+getVar :: Env -> String -> IOThrowsError LispVal
+getVar envRef var = do env <- liftIO $ readIORef envRef
+                       maybe (throwError $ UnboundVar "Getting an unbound variable" var)
+                             (liftIO . readIORef)
+                             (lookup var env)
+
+-- writeIORef handles updating a mutable variable. We return the value at
+-- the end for convenience.
+setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+setVar envRef var value = do env <- liftIO $ readIORef envRef
+                             maybe (throwError $ UnboundVar "Setting an unbound variable" var)
+                                   (liftIO . (flip writeIORef value))
+                                   (lookup var env)
+                             return value
+
+defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+defineVar envRef var value = do
+        alreadyDefined <- liftIO $ isBound envRef var
+        if alreadyDefined
+            then setVar envRef var value >> return value
+            else liftIO $ do
+                valueRef <- newIORef value
+                env <- readIORef envRef
+                writeIORef envRef ((var, valueRef) : env)
+                return value
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
+    where extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
+          addBinding (var, value) = do ref <- newIORef value
+                                       return (var, ref)
 
 -----------------------------------------------------
 -- REPL
@@ -293,11 +359,11 @@ flushStr str = putStr str >> hFlush stdout
 readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
-evalString :: String -> IO String
-evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+evalString :: Env -> String -> IO String
+evalString env expr = runIOThrows $ liftM show $ (liftThrows $ readExpr expr) >>= eval env
 
-evalAndPrint :: String -> IO ()
-evalAndPrint expr = evalString expr >>= putStrLn
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr = evalString env expr >>= putStrLn
 
 -- Underscore is a naming convention for monadic functions that repeat
 -- without returning a value.
@@ -308,12 +374,15 @@ until_ pred prompt action = do
         then return ()
         else action result >> until_ pred prompt action
 
+runOne :: String -> IO ()
+runOne expr = nullEnv >>= flip evalAndPrint expr
+
 runRepl :: IO ()
-runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
+runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
 
 main :: IO ()
 main = do args <- getArgs
           case length args of
               0 -> runRepl
-              1 -> evalAndPrint $ args !! 0
+              1 -> runOne $ args !! 0
               otherwise -> putStrLn "Program only takes 0 or 1 argument"
