@@ -72,6 +72,8 @@ data LispVal = Atom String
              | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
              | Func { params :: [String], vararg :: (Maybe String),
                       body :: [LispVal], closure :: Env }
+             | IOFunc ([LispVal] -> IOThrowsError LispVal)
+             | Port Handle
 
 instance Show LispVal where show = showVal
 
@@ -89,6 +91,8 @@ showVal (Func {params = args, vararg = varargs, body = body, closure = env}) =
          (case varargs of
             Nothing -> ""
             Just arg -> " . " ++ arg) ++ ") ...)"
+showVal (Port _) = "<IO port>"
+showVal (IOFunc _) = "<IO primitive>"
 
 parseExpr :: Parser LispVal
 parseExpr = parseAtom
@@ -192,6 +196,7 @@ apply (Func params varargs body closure) args =
               bindVarArgs arg env = case arg of
                     Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
                     Nothing -> return env
+apply (IOFunc func) args = func args
 
 -- List of pairs, the keys are Strings and the values are functions mapping
 -- [LispVal] -> LispVal. This lookup will return a numericBinop which has
@@ -308,10 +313,13 @@ trapError action = catchError action (return . show)
 extractValue :: ThrowsError a -> a
 extractValue (Right val) = val
 
-readExpr :: String -> ThrowsError LispVal
-readExpr input = case parse parseExpr "lisp" input of
+readOrThrow :: Parser a -> String -> ThrowsError a
+readOrThrow parser input = case parse parser "lisp" input of
     Left err -> throwError $ Parser err
     Right val -> return val
+
+readExpr = readOrThrow parseExpr
+readExprList = readOrThrow (endBy parseExpr spaces)
 
 -----------------------------------------------------
 -- State and Variables
