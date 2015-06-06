@@ -182,6 +182,8 @@ eval env (List (function : args)) = do
         func <- eval env function
         argVals <- mapM (eval env) args
         apply func argVals
+eval env (List [Atom "load", String filename]) =
+        load filename >>= liftM last . mapM (eval env)
 eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
@@ -197,6 +199,24 @@ apply (Func params varargs body closure) args =
                     Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
                     Nothing -> return env
 apply (IOFunc func) args = func args
+
+-- Wrapper that deconstructs an argument list into the form apply expects
+applyProc :: [LispVal] -> IOThrowsError LispVal
+applyProc [func, List args] = apply func args
+applyProc (func : args) = apply func args
+
+-- These are more primitives, but they have a different type signature and
+-- thus cannot be put in with the primitives function below
+ioPrimitives :: [(String, [LispVal] -> IOThrowsError LispVal)]
+ioPrimitives = [("apply", applyProc),
+                ("open-input-file", makePort ReadMode),
+                ("open-output-file", makePort WriteMode),
+                ("close-input-port", closePort),
+                ("close-output-port", closePort),
+                ("read", readProc),
+                ("write", writeProc),
+                ("read-contents", readContents),
+                ("read-all", readAll)]
 
 -- List of pairs, the keys are Strings and the values are functions mapping
 -- [LispVal] -> LispVal. This lookup will return a numericBinop which has
@@ -254,7 +274,7 @@ unpackBool :: LispVal -> ThrowsError Bool
 unpackBool (Bool b) = return b
 unpackBool notBool = throwError $ TypeMismatch "boolean" notBool
 
--- Wrappe which takes an operator and a parameter list, applies the
+-- Wrapper which takes an operator and a parameter list, applies the
 -- operator across the list and constructs a Number type out of result of
 -- using built-in Haskell math operations on the unpacked list.
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
@@ -283,6 +303,34 @@ unpackEquals arg1 arg2 (AnyUnpacker unpacker) =
            unpacked2 <- unpacker arg2
            return $ unpacked1 == unpacked2
     `catchError` (const $ return False)
+
+makePort :: IOMode -> [LispVal] -> IOThrowsError LispVal
+makePort mode [String filename] = liftM Port $ liftIO $ openFile filename mode
+
+closePort :: [LispVal] -> IOThrowsError LispVal
+closePort [Port port] = liftIO $ hClose port >> (return $ Bool True)
+closePort _ = return $ Bool False
+
+-- Wraps hGetline, sends the result to readExpr to be parsed into Scheme
+readProc :: [LispVal] -> IOThrowsError LispVal
+readProc [] = readProc [Port stdin]
+readProc [Port port] = (liftIO $ hGetLine port) >>= liftThrows . readExpr
+
+-- Convert a lispval to a string, then write it to the port (file).
+-- If none is given, write it to stdout
+writeProc :: [LispVal] -> IOThrowsError LispVal
+writeProc [obj] = writeProc [obj, Port stdout]
+writeProc [obj, Port port] = liftIO $ hPrint port obj >> (return $ Bool True)
+
+-- Convert an entire file into a huge string
+readContents :: [LispVal] -> IOThrowsError LispVal
+readContents [String filename] = liftM String $ liftIO $ readFile filename
+
+load :: String -> IOThrowsError [LispVal]
+load filename = (liftIO $ readFile filename) >>= liftThrows . readExprList
+
+readAll :: [LispVal] -> IOThrowsError LispVal
+readAll [String filename] = liftM List $ load filename
 
 data LispError = NumArgs Integer [LispVal]
                | TypeMismatch String LispVal
@@ -328,7 +376,7 @@ type Env = IORef [(String, IORef LispVal)]
 nullEnv :: IO Env
 nullEnv = newIORef []
 
--- This is a type synonym for a compined LispError and IO monad, using the
+-- This is a type synonym for a combined LispError and IO monad, using the
 -- ErrorT monad transformation
 type IOThrowsError = ErrorT LispError IO
 
@@ -410,18 +458,19 @@ until_ pred prompt action = do
 
 -- On startup, map all the default primitive functions into the environment
 primitiveBindings :: IO Env
-primitiveBindings = nullEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
-    where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
+primitiveBindings = nullEnv >>= (flip bindVars $ map (makeFunc IOFunc) ioPrimitives
+                                               ++ map (makeFunc PrimitiveFunc) primitives)
+    where makeFunc constructor (var, func) = (var, constructor func)
 
-runOne :: String -> IO ()
-runOne expr = primitiveBindings >>= flip evalAndPrint expr
+runOne :: [String] -> IO ()
+runOne args = do
+        env <- primitiveBindings >>= flip bindVars [("args", List $ map String $ drop 1 args)]
+        (runIOThrows $ liftM show $ eval env (List [Atom "load", String (args !! 0)]))
+            >>= hPutStrLn stderr
 
 runRepl :: IO ()
 runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
 
 main :: IO ()
 main = do args <- getArgs
-          case length args of
-              0 -> runRepl
-              1 -> runOne $ args !! 0
-              otherwise -> putStrLn "Program only takes 0 or 1 argument"
+          if null args then runRepl else runOne $ args
